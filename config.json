@@ -1,0 +1,9 @@
+{
+  "dataframes": {
+    "India": "data/amazon_india.csv",
+    "US": "data/amazon_usa.csv",
+    "UK": "data/amazon_uk.csv",
+    "Canada": "data/amazon_canada.csv",
+    "India_2022": "data/amazon.csv"
+  }
+}
