@@ -2,9 +2,7 @@
 # Edit at https://www.toptal.com/developers/gitignore?templates=python
 
 .DS_Store
-
-# 로컬 데이터 파일 무시
-data/
+./data/*
 
 ### Python ###
 # Byte-compiled / optimized / DLL files
