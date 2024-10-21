@@ -115,12 +115,73 @@ class AmazonAnalyzer:
         presence_df = self.compare_columns_presence()
         return presence_df[presence_df.all(axis=1)].index.tolist()
 
+
     def top_items(self, df_name, column, n=10, sort_by=None):
         df = self.get_dataframe(df_name)
         if sort_by is None:
             return df[column].value_counts().nlargest(n)
         else:
             return df.groupby(column)[sort_by].sum().nlargest(n)
+
+    def top_items_filtered(self, df_name, column, filter_column=None, filter_value=None, sort_by=None, n=10):
+        """
+        Get top items with optional filtering and sorting
+        
+        Parameters:
+        df_name (str): Name of the dataframe to analyze
+        column (str): Column to show in results (e.g., 'product_name')
+        filter_column (str): Column to filter on (e.g., 'category')
+        filter_value (str): Value to filter by (e.g., 'suitcase')
+        sort_by (str): Column to sort by (e.g., 'discounted_price')
+        n (int): Number of results to return
+        
+        Returns:
+        pandas.Series: Top n items meeting the criteria
+        """
+        df = self.get_dataframe(df_name)
+        
+        # Apply filter if specified
+        if filter_column is not None and filter_value is not None:
+            df = df[df[filter_column] == filter_value]
+        
+        # Sort and group
+        if sort_by is None:
+            return df[column].value_counts().nlargest(n)
+        else:
+            # Return both the sort column and the display column
+            result = df.sort_values(by=sort_by, ascending=False)[['product_name', sort_by]].head(n)
+            return result
+
+    def top_items_multi_filter(self, df_name, column, filters=None, sort_by=None, n=10):
+        """
+        filters = {
+            'category': 'suitcase',
+            'isBestSeller': True,
+            'rating': 4.5
+        }
+        """
+        df = self.get_dataframe(df_name)
+        
+        # Apply multiple filters
+        if filters:
+            for col, value in filters.items():
+                df = df[df[col] == value]
+        
+        if sort_by is None:
+            return df[column].value_counts().nlargest(n)
+        else:
+            result = df.sort_values(by=sort_by, ascending=False)[[column, sort_by]].head(n)
+            return result
+
+    def top_items_price_range(self, df_name, column, price_column, min_price=None, max_price=None, n=10):
+        df = self.get_dataframe(df_name)
+        
+        if min_price is not None:
+            df = df[df[price_column] >= min_price]
+        if max_price is not None:
+            df = df[df[price_column] <= max_price]
+        
+        return df.sort_values(by=price_column, ascending=False)[[column, price_column]].head(n)
 
     def plot_distribution(self, df_name, column):
         try:
@@ -139,6 +200,77 @@ class AmazonAnalyzer:
             plt.show()
         except Exception as e:
             print(f"Error in plot_distribution: {str(e)}")
+
+    def analyze_categories(self, df_name, top_n=20, show_percent=True):
+        """
+        카테고리 분석을 수행하는 메서드
+        
+        Parameters:
+        df_name (str): 분석할 데이터프레임 이름
+        top_n (int): 상위 몇 개의 카테고리를 볼 것인지
+        show_percent (bool): 백분율 표시 여부
+        
+        Returns:
+        pandas.DataFrame: 카테고리 분석 결과
+        """
+        df = self.get_dataframe(df_name)
+        
+        # 카테고리별 상품 수 계산
+        category_counts = df['category'].value_counts()
+        total_items = len(df)
+        
+        # 상위 N개 카테고리 선택
+        top_categories = category_counts.head(top_n)
+        
+        # 결과 데이터프레임 생성
+        results = pd.DataFrame({
+            'category': top_categories.index,
+            'item_count': top_categories.values,
+            'percentage': (top_categories.values / total_items * 100).round(2)
+        })
+        
+        # 결과 출력
+        print(f"\n=== {df_name} 카테고리 분석 ===")
+        print(f"총 카테고리 수: {len(category_counts):,}개")
+        print(f"총 상품 수: {total_items:,}개\n")
+        
+        print(f"상위 {top_n}개 카테고리:")
+        for idx, row in results.iterrows():
+            if show_percent:
+                print(f"{idx+1:2d}. {row['category']:<40} {row['item_count']:,}개 ({row['percentage']}%)")
+            else:
+                print(f"{idx+1:2d}. {row['category']:<40} {row['item_count']:,}개")
+        
+        # 기타 카테고리 정보 출력
+        other_items = total_items - results['item_count'].sum()
+        other_percent = (other_items / total_items * 100).round(2)
+        print(f"\n기타 카테고리: {other_items:,}개 ({other_percent}%)")
+        
+        return results
+
+    def analyze_category_metrics(self, df_name, metric_column, top_n=20):
+        """
+        카테고리별 특정 지표 분석
+        
+        Parameters:
+        df_name (str): 데이터프레임 이름
+        metric_column (str): 분석할 지표 컬럼 (예: 'discounted_price', 'rating')
+        top_n (int): 상위 몇 개의 카테고리를 볼 것인지
+        """
+        df = self.get_dataframe(df_name)
+        
+        # 카테고리별 평균값 계산
+        category_metrics = df.groupby('category')[metric_column].agg(['mean', 'count', 'std']).round(2)
+        category_metrics = category_metrics.sort_values('mean', ascending=False).head(top_n)
+        
+        print(f"\n=== 카테고리별 평균 {metric_column} 분석 (상위 {top_n}개) ===")
+        for idx, (category, row) in enumerate(category_metrics.iterrows(), 1):
+            if metric_column.lower().find('price') >= 0:
+                mean_value = format_korean_number(row['mean'])  # 이전에 만든 가격 포맷팅 함수 사용
+            else:
+                mean_value = f"{row['mean']:.2f}"
+            
+            print(f"{idx:2d}. {category:<40} {mean_value} (상품수: {row['count']:,}개)")
 
     @classmethod
     def from_config(cls, config_filename, project_root):
@@ -201,6 +333,37 @@ def get_columns_by_presence(self, min_true_count=4):
     return get_common_columns_by_threshold(self, min_true_count)
 
     # Add more EDA methods as needed
+
+def format_korean_number(number):
+    if number == 0:
+        return "0원"
+    
+    units = ['원', '만', '억', '조']
+    result = []
+    
+    # 음수 체크
+    is_negative = number < 0
+    number = abs(int(number))
+    
+    for i, unit in enumerate(units):
+        unit_value = number % 10000
+        if unit_value > 0:
+            if i == 0:  # '원' 단위일 때는 쉼표 포함
+                result.append(f"{unit_value:,}{unit}")
+            else:
+                result.append(f"{unit_value}{unit}")
+        number //= 10000
+        if number == 0:
+            break
+    
+    # 결과를 역순으로 조합
+    final_result = ' '.join(reversed(result))
+    
+    # 음수면 앞에 마이너스 표시
+    if is_negative:
+        final_result = f"-{final_result}"
+        
+    return final_result
 
 # Example usage
 if __name__ == "__main__":
