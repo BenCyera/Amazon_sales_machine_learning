@@ -6,11 +6,17 @@ import scipy as sp
 import os
 import pickle
 import json
+from typing import Dict, List, Set, Tuple
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+import itertools
+from functools import lru_cache
 
 class AmazonDataframe:
     def __init__(self, file_path):
         self.file_path = file_path
         self._df = None
+        self._category_converted = False
         self.verify_file_path()
 
     def verify_file_path(self):
@@ -22,12 +28,35 @@ class AmazonDataframe:
             raise PermissionError(f"You don't have permission to read the file {self.file_path}")
         print(f"File path verified: {self.file_path}")
 
+    def _convert_category_column(self):
+            """Convert category column to categorical type if possible"""
+            if 'category' not in self._df.columns:
+                print(f"Warning: No 'category' column found in {self.file_path}")
+                return
+            
+            # Check if category column contains boolean values
+            if self._df['category'].dtype == bool:
+                print(f"Warning: 'category' column in {self.file_path} contains boolean values. "
+                    "Skipping conversion to categorical type. Please check the data.")
+                return
+            
+            try:
+                self._df['category'] = self._df['category'].astype('category')
+                self._category_converted = True
+                print(f"Successfully converted 'category' column to categorical type in {self.file_path}")
+            except Exception as e:
+                print(f"Error converting 'category' column in {self.file_path}: {str(e)}")
+
     @property
     def df(self):
         if self._df is None:
             try:
                 self._df = pd.read_csv(self.file_path)
                 print(f"Successfully loaded CSV from {self.file_path}")
+                # Convert category column after loading
+                if not self._category_converted:
+                    self._convert_category_column()
+
             except pd.errors.EmptyDataError:
                 print(f"Warning: The file {self.file_path} is empty. Creating an empty DataFrame.")
                 self._df = pd.DataFrame()
@@ -45,6 +74,21 @@ class AmazonDataframe:
     def column_names(self):
         return list(self.df.columns)
 
+    def category_summary(self):
+        """Print summary of category column"""
+        if self._df is None:
+            self.df  # This will trigger loading the dataframe
+        
+        if 'category' not in self._df.columns:
+            print("No 'category' column found in the dataframe")
+            return
+        
+        print(f"\nCategory Summary for {self.file_path}:")
+        print(f"Data type: {self._df['category'].dtype}")
+        print(f"Number of unique categories: {self._df['category'].nunique()}")
+        print(f"Top 5 most common categories:")
+        print(self._df['category'].value_counts().head())
+
     # Add more EDA methods as needed
 
 class AmazonAnalyzer:
@@ -54,7 +98,8 @@ class AmazonAnalyzer:
         if not os.path.exists(cache_dir):
             os.makedirs(cache_dir)
 
-    def add_dataframe(self, name, file_path):
+    def add_dataframe(self, name: str, file_path):
+        """Add a dataframe to the analyzer"""
         cache_path = os.path.join(self.cache_dir, f"{name}.pkl")
         
         if os.path.exists(cache_path):
@@ -302,6 +347,309 @@ class AmazonAnalyzer:
             print(f"Error: 'dataframes' key not found in {config_path}.")
         return None
     
+    # Add this method to your AmazonAnalyzer class
+    def get_columns_by_presence(self, min_true_count=4):
+        """
+        Wrapper method for the analyzer class
+        """
+        return get_common_columns_by_threshold(self, min_true_count)
+
+        # Add more EDA methods as needed
+
+    def _process_product_pair(self, data: tuple) -> dict:
+        """Process a single pair of dataframes for product overlap"""
+        df1_name, df2_name, df1, df2 = data
+        
+        # Convert to sets for faster intersection
+        df1_ids = set(df1['product_id'].unique())
+        df2_ids = set(df2['product_id'].unique())
+        
+        common_ids = df1_ids & df2_ids
+        
+        if not common_ids:
+            return None
+            
+        # Create dictionaries for faster lookup
+        df1_names = df1[df1['product_id'].isin(common_ids)].set_index('product_id')['product_name']
+        df2_names = df2[df2['product_id'].isin(common_ids)].set_index('product_id')['product_name']
+        
+        name_conflicts = []
+        for pid in common_ids:
+            if df1_names[pid] != df2_names[pid]:
+                name_conflicts.append({
+                    'product_id': pid,
+                    f'{df1_name}_name': df1_names[pid],
+                    f'{df2_name}_name': df2_names[pid]
+                })
+
+        return {
+            'pair': f"{df1_name}_vs_{df2_name}",
+            'common_ids': common_ids,
+            'name_conflicts': name_conflicts,
+            'stats': {
+                'common_products': len(common_ids),
+                'name_conflicts': len(name_conflicts),
+                'overlap_percentage': len(common_ids) / len(df1_ids) * 100
+            }
+        }
+
+    def analyze_product_overlaps(self) -> Dict:
+        """
+        Optimized analysis of product ID overlaps and name consistency
+        """
+        # Check cache first
+        cache_path = os.path.join(self.cache_dir, 'product_overlap_analysis.json')
+        if os.path.exists(cache_path):
+            with open(cache_path, 'r') as f:
+                return json.load(f)
+
+        results = {
+            'overlap_summary': {},
+            'name_conflicts': {},
+            'timestamp': datetime.now().isoformat()
+        }
+
+        # Prepare data for parallel processing
+        df_pairs = []
+        df_names = list(self.dataframes.keys())
+        for i, j in itertools.combinations(range(len(df_names)), 2):
+            df1_name = df_names[i]
+            df2_name = df_names[j]
+            df_pairs.append((
+                df1_name,
+                df2_name,
+                self.dataframes[df1_name].df,
+                self.dataframes[df2_name].df
+            ))
+
+        # Process in parallel
+        with ThreadPoolExecutor(max_workers=min(os.cpu_count(), 4)) as executor:
+            futures = [executor.submit(self._process_product_pair, pair) 
+                      for pair in df_pairs]
+            
+            for future in futures:
+                result = future.result()
+                if result:
+                    pair_key = result['pair']
+                    results['overlap_summary'][pair_key] = result['stats']
+                    if result['name_conflicts']:
+                        results['name_conflicts'][pair_key] = result['name_conflicts']
+
+        # Cache results
+        with open(cache_path, 'w') as f:
+            json.dump(results, f, indent=2)
+
+        return results
+
+    def _process_category_pair(self, data: tuple) -> dict:
+        """Process a single pair of dataframes for category analysis"""
+        df1_name, df2_name, df1_cats, df2_cats = data
+        
+        cats1 = set(df1_cats)
+        cats2 = set(df2_cats)
+        
+        return {
+            'pair': f"{df1_name}_vs_{df2_name}",
+            'common_categories': list(cats1 & cats2),
+            f'unique_to_{df1_name}': list(cats1 - cats2),
+            f'unique_to_{df2_name}': list(cats2 - cats1)
+        }
+
+    def analyze_categories(self) -> Dict:
+        """
+        Optimized analysis of category differences and distributions
+        """
+        # Check cache first
+        cache_path = os.path.join(self.cache_dir, 'category_analysis.json')
+        if os.path.exists(cache_path):
+            with open(cache_path, 'r') as f:
+                return json.load(f)
+
+        results = {
+            'category_summary': {},
+            'category_mapping': {},
+            'timestamp': datetime.now().isoformat()
+        }
+
+        # Process individual dataframe summaries
+        for name, df_obj in self.dataframes.items():
+            # Convert to categorical for better performance
+            df_obj.df['category'] = df_obj.df['category'].astype('category')
+            category_dist = df_obj.df['category'].value_counts().to_dict()
+            unique_cats = set(df_obj.df['category'].unique())
+            
+            results['category_summary'][name] = {
+                'total_categories': len(unique_cats),
+                'category_distribution': category_dist
+            }
+
+        # Prepare data for parallel processing
+        df_pairs = []
+        df_names = list(self.dataframes.keys())
+        for i, j in itertools.combinations(range(len(df_names)), 2):
+            df1_name = df_names[i]
+            df2_name = df_names[j]
+            df_pairs.append((
+                df1_name,
+                df2_name,
+                self.dataframes[df1_name].df['category'].unique(),
+                self.dataframes[df2_name].df['category'].unique()
+            ))
+
+        # Process pairs in parallel
+        with ThreadPoolExecutor(max_workers=min(os.cpu_count(), 4)) as executor:
+            futures = [executor.submit(self._process_category_pair, pair) 
+                      for pair in df_pairs]
+            
+            for future in futures:
+                result = future.result()
+                results['category_mapping'][result['pair']] = {
+                    'common_categories': result['common_categories'],
+                    f'unique_to_{result["pair"].split("_vs_")[0]}': result[f'unique_to_{result["pair"].split("_vs_")[0]}'],
+                    f'unique_to_{result["pair"].split("_vs_")[1]}': result[f'unique_to_{result["pair"].split("_vs_")[1]}']
+                }
+
+        # Cache results
+        with open(cache_path, 'w') as f:
+            json.dump(results, f, indent=2)
+
+        return results
+
+    def print_analysis_summary(self, min_overlap_percent: float = 5.0):
+        """
+        Print a comprehensive summary of the analysis
+        """
+        # Product overlaps
+        product_results = self.analyze_product_overlaps()
+        print("\n=== Product Overlap Analysis ===")
+        for pair, stats in product_results['overlap_summary'].items():
+            if stats['overlap_percentage'] >= min_overlap_percent:
+                print(f"\n{pair}:")
+                print(f"Common products: {stats['common_products']}")
+                print(f"Name conflicts: {stats['name_conflicts']}")
+                print(f"Overlap percentage: {stats['overlap_percentage']:.1f}%")
+
+        # Category analysis
+        category_results = self.analyze_categories()
+        print("\n=== Category Analysis ===")
+        for name, summary in category_results['category_summary'].items():
+            print(f"\n{name}:")
+            print(f"Total categories: {summary['total_categories']}")
+            print("Top 5 categories by product count:")
+            top_cats = dict(sorted(summary['category_distribution'].items(), 
+                                 key=lambda x: x[1], reverse=True)[:5])
+            for cat, count in top_cats.items():
+                print(f"- {cat}: {count} products")
+
+    @lru_cache(maxsize=128)
+    def _calculate_similarity(self, str1: str, str2: str) -> float:
+        """Cached similarity calculation"""
+        from difflib import SequenceMatcher
+        return SequenceMatcher(None, str1.lower(), str2.lower()).ratio()
+
+    def _process_category_pair(self, pair_data: tuple) -> tuple:
+        """Process a single pair of categories"""
+        cat1, cat2 = pair_data
+        score = self._calculate_similarity(cat1, cat2)
+        return (cat1, cat2, score) if score > 0.6 else None
+
+    def get_category_mapping_suggestions(self, batch_size: int = 1000) -> Dict:
+        """
+        Generate suggestions for mapping categories between dataframes
+        using batched processing and parallel execution.
+        Skips dataframes that contain boolean values in their category column.
+        """
+        results = {
+            'mapping_suggestions': {},
+            'timestamp': datetime.now().isoformat(),
+            'skipped_dataframes': []  # Track skipped dataframes
+        }
+        
+        df_names = list(self.dataframes.keys())
+        valid_df_names = []
+        
+        # Check each dataframe for boolean values in category column
+        for df_name in df_names:
+            categories = self.dataframes[df_name].df['category']
+            if categories.dtype == bool or categories.apply(lambda x: isinstance(x, bool)).any():
+                results['skipped_dataframes'].append({
+                    'name': df_name,
+                    'reason': 'Contains boolean values in category column'
+                })
+            else:
+                valid_df_names.append(df_name)
+        
+        # Use ThreadPoolExecutor for parallel processing
+        with ThreadPoolExecutor(max_workers=min(os.cpu_count(), 4)) as executor:
+            for i, j in itertools.combinations(range(len(valid_df_names)), 2):
+                df1_name = valid_df_names[i]
+                df2_name = valid_df_names[j]
+                
+                # Get unique categories
+                cats1 = list(set(self.dataframes[df1_name].df['category'].unique()))
+                cats2 = list(set(self.dataframes[df2_name].df['category'].unique()))
+                
+                # Create batches of category pairs
+                category_pairs = list(itertools.product(cats1, cats2))
+                
+                # Process in batches
+                mapping_suggestions = {}
+                for batch_start in range(0, len(category_pairs), batch_size):
+                    batch_end = min(batch_start + batch_size, len(category_pairs))
+                    batch = category_pairs[batch_start:batch_end]
+                    
+                    # Process batch in parallel
+                    futures = [executor.submit(self._process_category_pair, pair)
+                            for pair in batch]
+                    
+                    # Collect results
+                    for future in futures:
+                        result = future.result()
+                        if result:
+                            cat1, cat2, score = result
+                            if cat1 not in mapping_suggestions:
+                                mapping_suggestions[cat1] = []
+                            mapping_suggestions[cat1].append({
+                                'category': cat2,
+                                'similarity_score': score
+                            })
+                
+                # Sort suggestions by similarity score
+                for cat in mapping_suggestions:
+                    mapping_suggestions[cat] = sorted(
+                        mapping_suggestions[cat],
+                        key=lambda x: x['similarity_score'],
+                        reverse=True
+                    )
+                
+                pair_key = f"{df1_name}_vs_{df2_name}"
+                results['mapping_suggestions'][pair_key] = mapping_suggestions
+        
+        # Cache results
+        cache_path = os.path.join(self.cache_dir, 'category_mapping_suggestions.json')
+        with open(cache_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        
+        return results
+
+    def print_mapping_suggestions(self, min_similarity: float = 0.7, max_suggestions: int = 3):
+        """
+        Print mapping suggestions with control over output size
+        """
+        mapping_suggestions = self.get_category_mapping_suggestions()
+        
+        for pair, suggestions in mapping_suggestions['mapping_suggestions'].items():
+            print(f"\nMapping suggestions for {pair}:")
+            for cat, matches in suggestions.items():
+                # Filter matches by similarity threshold
+                good_matches = [m for m in matches if m['similarity_score'] >= min_similarity]
+                if good_matches:
+                    print(f"\n{cat} matches:")
+                    # Limit number of suggestions printed
+                    for match in good_matches[:max_suggestions]:
+                        print(f"- {match['category']} "
+                              f"(similarity: {match['similarity_score']:.2f})")
+
 def get_common_columns_by_threshold(analyzer, min_true_count=4):
     """
     Get columns that are present (True) in at least min_true_count dataframes
@@ -324,15 +672,6 @@ def get_common_columns_by_threshold(analyzer, min_true_count=4):
     filtered_columns = presence_df[true_counts >= min_true_count].index.tolist()
     
     return filtered_columns
-
-# Add this method to your AmazonAnalyzer class
-def get_columns_by_presence(self, min_true_count=4):
-    """
-    Wrapper method for the analyzer class
-    """
-    return get_common_columns_by_threshold(self, min_true_count)
-
-    # Add more EDA methods as needed
 
 def format_korean_number(number):
     if number == 0:
